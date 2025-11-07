@@ -19,7 +19,7 @@ import os
 from utils_.distributed import init_distributed_mode
 from utils_.logger import create_logger
 from dataset.build import build_dataset
-from autoregressive.train.train_c2i import creat_optimizer
+from autoregressive.train.training_helpers import creat_optimizer
 from autoregressive.models.gpt import GPT_models
 from tokenizer.tokenizer_image.vq_model import VQ_models
 import signal
@@ -83,15 +83,6 @@ def main(args):
 
         logger = create_logger(experiment_dir, rank )
         logger.info(f"Experiment directory created at {experiment_dir}")
-
-
-        if not args.no_cloud_save:
-
-            time_record = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
-            cloud_results_dir = f"{args.cloud_save_path}/{time_record}"
-            cloud_checkpoint_dir = f"{cloud_results_dir}/{experiment_index:03d}-{model_string_name}/checkpoints"
-            os.makedirs(cloud_checkpoint_dir, exist_ok=True)
-            logger.info(f"Experiment directory created in cloud at {cloud_checkpoint_dir}")
 
     
     else:
@@ -170,6 +161,21 @@ def main(args):
     # Setup optimizer
     optimizer = creat_optimizer(model, args.weight_decay, args.lr, (args.beta1, args.beta2), logger)
 
+    def interpolate_target_aware_pe_if_necessary(checkpoint):
+        if not 'target_aware_pos_embed_postfix' in checkpoint['model']:
+            return
+        target_aware_pos_embed_postfix_orig = checkpoint['model']['target_aware_pos_embed_postfix']
+        orig_seq_len = target_aware_pos_embed_postfix_orig.size(1)
+        orig_grid_num = int(orig_seq_len ** 0.5)
+        new_seq_len = model.image_seq_len
+        new_grid_num = int(new_seq_len ** 0.5)
+        if new_grid_num != orig_grid_num:
+            target_aware_pos_embed_postfix_orig_2d = target_aware_pos_embed_postfix_orig.permute(0,2,1).reshape(1, -1, orig_grid_num, orig_grid_num)
+            target_aware_pos_embed_postfix = torch.nn.functional.interpolate(target_aware_pos_embed_postfix_orig_2d, size=(new_grid_num, new_grid_num), mode='bicubic', align_corners=False)
+            target_aware_pos_embed_postfix = target_aware_pos_embed_postfix.reshape(1, -1, new_seq_len).permute(0,2,1)
+
+            checkpoint['model']['target_aware_pos_embed_postfix'] = target_aware_pos_embed_postfix
+
     # Prepare models for training:
     if args.gpt_ckpt:
         checkpoint = torch.load(args.gpt_ckpt, map_location="cpu")
@@ -185,8 +191,12 @@ def main(args):
         start_epoch = 0
     if args.init_gpt_ckpt:
         checkpoint = torch.load(args.init_gpt_ckpt, map_location="cpu")
+        interpolate_target_aware_pe_if_necessary(checkpoint=checkpoint)
         msg = model.load_state_dict(checkpoint["model"], strict=False)
         print(f"init from {args.init_gpt_ckpt}", msg)
+
+
+
 
     # 
     if args.lr_scheduler_annealing == 'none':
@@ -224,10 +234,6 @@ def main(args):
                 checkpoint_path = f"{checkpoint_dir}/interrupted_{train_steps:07d}.pt"
                 torch.save(checkpoint, checkpoint_path)
                 logger.info(f"Saved checkpoint to {checkpoint_path} due to unexpected exit")
-            if not args.no_cloud_save:
-                cloud_checkpoint_path = f"{cloud_checkpoint_dir}/interrupted_{train_steps:07d}.pt"
-                torch.save(checkpoint, cloud_checkpoint_path)
-                logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path} due to unexpected exit")
         dist.destroy_process_group()
         exit(0)
     if rank == 0:
@@ -423,16 +429,10 @@ def main(args):
                             oldest_checkpoint = checkpoint_files[0]
                             os.remove(oldest_checkpoint)
                             logger.info(f"Deleted oldest checkpoint {oldest_checkpoint} to maintain max checkpoints limit")
-                    if not args.no_cloud_save:
-                        cloud_checkpoint_path = f"{cloud_checkpoint_dir}/{train_steps:07d}.pt"
-                        torch.save(checkpoint, cloud_checkpoint_path)
-                        logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path}")
                 dist.barrier()
 
             if args.validate_every != -1 and train_steps % args.validate_every == 0:
-                dist.barrier()
-                model.eval()
-
+                dist.barrier()                
                 ckpt_string_name = f"{checkpoint_dir}-{train_steps:07d}" 
 
                 if rank == 0:                    
@@ -440,8 +440,10 @@ def main(args):
                     # prepare parameters for sampling
                     # Create a temporary directory
                     if 'magicbrush' in args.val_dataset:
+                        model.eval()
                         sampling_save_path = os.path.join(os.path.dirname(ckpt_string_name), f"samples-ckpt-{train_steps:07d}" )                
                         os.makedirs(sampling_save_path, exist_ok=True)
+                        args.magicbrush_output_dir=sampling_save_path
                         print('saving the sampled results to ', args.magicbrush_output_dir)
                         sample_magicbrush_test(args, model.module, None, vq_model, latent_size, loss.device, 
                                             mask_in_context = args.mask_in_context,
@@ -456,6 +458,7 @@ def main(args):
                         model.train()
 
                 if 'emuedit_test' in args.val_dataset:
+                    model.eval()
                     emuedit_sampling_save_path = os.path.join(os.path.dirname(ckpt_string_name), f"emuedit_test_samples-ckpt-{train_steps:07d}" )                
                     os.makedirs(emuedit_sampling_save_path, exist_ok=True)
                     args.emuedit_test_output_dir = emuedit_sampling_save_path
@@ -472,39 +475,6 @@ def main(args):
             dist.barrier()
             
 
-            
-        # save checkpoint for each epoch
-        if not args.no_epoch_save:
-            if rank == 0:
-                model_weight = model.module.state_dict()
-                checkpoint = {
-                    "model": model_weight,
-                    "optimizer": optimizer.state_dict(),
-                    "steps": train_steps,
-                    "args": args
-                }
-                if not args.no_local_save:
-                    checkpoint_path = f"{checkpoint_dir}/epoch_{epoch:03d}_{train_steps:07d}.pt"
-                    torch.save(checkpoint, checkpoint_path)
-                    logger.info(f"Saved checkpoint to {checkpoint_path}")
-
-                    # Check and delete the oldest checkpoint if the total number exceeds the threshold
-                    checkpoint_files = sorted(glob(f"{checkpoint_dir}/*.pt"), key=os.path.getctime)
-                    if len(checkpoint_files) > args.max_checkpoints:
-                        oldest_checkpoint = checkpoint_files[0]
-                        os.remove(oldest_checkpoint)
-                        logger.info(f"Deleted oldest checkpoint {oldest_checkpoint} to maintain max checkpoints limit")
-                if not args.no_cloud_save:
-                    cloud_checkpoint_path = f"{cloud_checkpoint_dir}/epoch_{epoch:03d}_{train_steps:07d}.pt"
-                    torch.save(checkpoint, cloud_checkpoint_path)
-                    logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path}")
-
-                    # Check and delete the oldest checkpoint if the total number exceeds the threshold
-                    checkpoint_files = sorted(glob(f"{cloud_checkpoint_path}/*.pt"), key=os.path.getctime)
-                    if len(checkpoint_files) > args.max_checkpoints:
-                        oldest_checkpoint = checkpoint_files[0]
-                        os.remove(oldest_checkpoint)
-                        logger.info(f"Deleted oldest checkpoint {oldest_checkpoint} to maintain max checkpoints limit")
 
         if exit_flag:
             break
@@ -528,7 +498,6 @@ if __name__ == "__main__":
     parser.add_argument("--short-t5-feat-path", type=str, default=None, help="short caption of t5_feat_path")
     parser.add_argument("--cloud-save-path", type=str, required=False, help='please specify a cloud disk path, if not, local path')
     parser.add_argument("--no-local-save", action='store_true', help='no save checkpoints to local path for limited disk volume')
-    parser.add_argument("--no-cloud-save", action='store_true', help='no save checkpoints to cloud')
 
     parser.add_argument("--vq-model", type=str, choices=list(VQ_models.keys()), default="VQ-16")
     parser.add_argument("--vq-ckpt", type=str, default=None, help="ckpt path for vq model")
@@ -545,7 +514,6 @@ if __name__ == "__main__":
 
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--dataset", type=str, default='editing_ultraedit')
-    parser.add_argument("--fake_masking", action='store_true')
     parser.add_argument("--enforce_fake_masking", action='store_true')
     parser.add_argument("--enforce_emu_validation_fake_masking", action='store_true')
     
@@ -619,18 +587,18 @@ if __name__ == "__main__":
 
 
     # for magicbrush test set inference
-    parser.add_argument("--magicbrush_input_path", type=str, required=True, help='input image folder for magicbrush test set, eg. /home/username/data/MagicBrush_test/test/images')
+    parser.add_argument("--magicbrush_input_path", type=str, help='input image folder for magicbrush test set, eg. /home/username/data/MagicBrush_test/test/images')
     parser.add_argument("--magicbrush_skip_iter",  action='store_true', help='skip iterative (multi-turn) editing for magicbrush test set')
     parser.add_argument("--instruction_based",  action='store_true', help='whether to use instructions or global captions as prompts')
-    parser.add_argument("--magicbrush_json", type=str, required=True, help='edit sessions for magicbrush test set, eg., /home/username/data/MagicBrush_test/test/edit_sessions_with_instruction_t5.json')
+    parser.add_argument("--magicbrush_json", type=str, help='edit sessions for magicbrush test set, eg., /home/username/data/MagicBrush_test/test/edit_sessions_with_instruction_t5.json')
     parser.add_argument("--with_t5_prompt",  action='store_true', help='whether to use instructions extracted by Flan T5') 
     parser.add_argument("--enforce_validation_fake_masking", action='store_true', help='whether to use fake masks (full image as editing region) during validation')
     
 
     # for magicbrush test set evaluation
-    parser.add_argument('--gt_path', type=str,required=True,
+    parser.add_argument('--gt_path', type=str,
                         help='Paths to the gt images (folders), eg. /home/username/data/MagicBrush_test/test/images/')
-    parser.add_argument('--caption_path', type=str, required=True,
+    parser.add_argument('--caption_path', type=str,
                         help='the file path to store the captions for text-image similarity calculation, eg., /home/username/data/MagicBrush_test/test/local_descriptions.json')
     parser.add_argument('--metric',
                         type=str,
@@ -661,14 +629,10 @@ if __name__ == "__main__":
         help="The type of the dataset to load.",
     )
     parser.add_argument(
-        "--emuedit_test_json",
-        type=str,
-        help="json file for emuedit test set, eg./home/username/data/emu_edit_test_set/emuedit_test_append_t5_instructions.jsonl",
-    )
-    parser.add_argument(
         "--valid_emuedit_test_data",
         type=str,
-        help="json file for emuedit test set, eg. /home/username/data/emu_edit_test_set/emu_test_data.json",
+        default="/home/username/data/emu_edit_test_set/emu_test_data.json",
+        help="json file for emuedit test set",
     )
     parser.add_argument('--emuedit_gt_path',
                         type=str,

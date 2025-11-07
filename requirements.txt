@@ -1,0 +1,17 @@
+bs4==4.13.0
+datasets==3.1.0
+diffusers==0.31.0
+einops==0.8.0
+image-reward==1.5
+imageio==2.35.1
+numpy==1.24.4
+openai-clip==1.0.1
+opencv-python==4.10.0.84
+pyiqa==0.1.13
+scipy==1.10.1
+tensorboard==2.14.0
+timm==0.6.13
+torch==2.4.0
+torchvision==0.19.0
+tqdm==4.66.5
+transformers==4.46.3

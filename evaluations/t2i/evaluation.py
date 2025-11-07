@@ -275,46 +275,7 @@ def evaluate_model(opt):
 
     return
 
-def evaluate_model_during_validation(ref_dir, ref_data, ref_type, fake_dir, eval_res,  eval_batch_size, eval_clip_model4eval, 
-                                     clip_device='cpu', fid_device = torch.device('cuda:0'), use_dataparallel = False):
-    ### Generated images
-    dset2 = EvalDataset(data_name=ref_data,
-                        data_dir=fake_dir,
-                        data_type="images",
-                        crop_long_edge=True,
-                        resize_size=eval_res,
-                        resizer="lanczos",
-                        normalize=True,
-                        load_txt_from_file=True if ref_data == "coco2014" else False,
-                        eval_bottom = -1)
 
-    dset2_dataloader = DataLoader(dataset=dset2,
-                                  batch_size=eval_batch_size,
-                                  shuffle=False,
-                                  pin_memory=True,
-                                  drop_last=False)
-    if ref_data == "coco2014":
-        clip_score = compute_clip_score(dset2_dataloader, clip_model=eval_clip_model4eval, how_many=30000, device=clip_device)
-        print(f"CLIP score: {clip_score}")
-
-    ref_sub_folder_name = "val2014" if ref_data == "coco2014" else ref_type
-    fake_sub_folder_name = "images"
-    print(f"evaluate_model_during_validation : {os.path.join(ref_dir, ref_sub_folder_name)}, {os.path.join(fake_dir, fake_sub_folder_name)}")
-    fid = compute_fid(
-        os.path.join(ref_dir, ref_sub_folder_name),
-        os.path.join(fake_dir, fake_sub_folder_name),
-        resize_size=eval_res,
-        feature_extractor="inception",
-        eval_bottom = -1, device=fid_device, 
-        use_dataparallel = use_dataparallel) # 
-
-    # txt_path = opt.fake_dir + '/score.txt'
-    # print("writing to {}".format(txt_path))
-    # print(f"FID_{opt.eval_res}px: {fid}")
-    # print(f"CLIP score: {clip_score}", file=f)
-    # print(f"FID_{opt.eval_res}px: {fid}", file=f)
-
-    return clip_score, fid
 if __name__ == "__main__":
     import argparse 
     parser = argparse.ArgumentParser()

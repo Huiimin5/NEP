@@ -442,11 +442,11 @@ if __name__ == '__main__':
                         help='Paths of generated images (folders)')
     parser.add_argument('--gt_path',
                         type=str,
-                        default = '/home/wuhuimin/data/MagicBrush_test/test/images/',
+                        default = '/home/{username}/data/MagicBrush_test/test/images/',
                         help='Paths to the gt images (folders)')
     parser.add_argument('--caption_path',
                         type=str,
-                        default="/home/wuhuimin/data/MagicBrush_test/test/local_descriptions.json",
+                        default="/home/{username}/data/MagicBrush_test/test/local_descriptions.json",
                         help='the file path to store the global captions for text-image similarity calculation')
     parser.add_argument('--metric',
                         type=str,

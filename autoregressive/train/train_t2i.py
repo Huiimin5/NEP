@@ -21,7 +21,7 @@ from utils_.distributed import init_distributed_mode
 from utils_.logger import create_logger
 from dataset.build import build_dataset
 from dataset.augmentation import center_crop_arr, center_crop_arr_removing_white_border
-from autoregressive.train.train_c2i import creat_optimizer
+from autoregressive.train.training_helpers import creat_optimizer
 from autoregressive.models.gpt import GPT_models
 from tokenizer.tokenizer_image.vq_model import VQ_models
 
@@ -33,16 +33,9 @@ from autoregressive.models.generate import generate_RLlamaGen,generate_with_deco
 from torchvision import transforms
 
 
-from evaluations.t2i.evaluation import evaluate_model_during_validation
-import pandas as pd
-import math
-from tqdm import tqdm
-from PIL import Image
-from torch.utils.data import Subset
 
 
-
-def main(args, val_args):
+def main(args):
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
     
     # Setup DDP:
@@ -83,15 +76,6 @@ def main(args, val_args):
 
         logger = create_logger(experiment_dir, rank )
         logger.info(f"Experiment directory created at {experiment_dir}")
-
-        if not args.no_cloud_save:
-
-            time_record = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
-            cloud_results_dir = f"{args.cloud_save_path}/{time_record}"
-            cloud_checkpoint_dir = f"{cloud_results_dir}/{experiment_index:03d}-{model_string_name}/checkpoints"
-            os.makedirs(cloud_checkpoint_dir, exist_ok=True)
-            logger.info(f"Experiment directory created in cloud at {cloud_checkpoint_dir}")
-
     
     else:
         checkpoint_dir = None
@@ -139,18 +123,12 @@ def main(args, val_args):
         checkpoint = torch.load(args.vq_ckpt, map_location="cpu")
         vq_model.load_state_dict(checkpoint["model"])
         del checkpoint       
-    if not args.aug_remove_white_borders:
-        transform = transforms.Compose([
-            transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
-        ])
-    else:
-        transform = transforms.Compose([
-            transforms.Lambda(lambda pil_image: center_crop_arr_removing_white_border(pil_image, args.image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
-        ])
+
+    transform = transforms.Compose([
+        transforms.Lambda(lambda pil_image: center_crop_arr_removing_white_border(pil_image, args.image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+    ])
     dataset = build_dataset(args, transform=transform)
 
     
@@ -292,158 +270,9 @@ def main(args, val_args):
                             oldest_checkpoint = checkpoint_files[0]
                             os.remove(oldest_checkpoint)
                             logger.info(f"Deleted oldest checkpoint {oldest_checkpoint} to maintain max checkpoints limit")
-                    if not args.no_cloud_save:
-                        cloud_checkpoint_path = f"{cloud_checkpoint_dir}/{train_steps:07d}.pt"
-                        torch.save(checkpoint, cloud_checkpoint_path)
-                        logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path}")
-
-                        # Check and delete the oldest checkpoint if the total number exceeds the threshold
-                        checkpoint_files = sorted(glob(f"{checkpoint_dir}/*.pt"), key=os.path.getctime)
-                        if len(checkpoint_files) > args.max_checkpoints:
-                            oldest_checkpoint = checkpoint_files[0]
-                            os.remove(oldest_checkpoint)
-                            logger.info(f"Deleted oldest checkpoint {oldest_checkpoint} to maintain max checkpoints limit")
-                dist.barrier()
-
-            # validate by calculating fid and clip score
-            if args.validate_every != -1 and train_steps % args.validate_every == 0:
-                dist.barrier()
-                model.eval()
-                # sample
-                # Create folder to save samples:
-                model_string_name = args.gpt_model.replace("/", "-")
-                ckpt_string_name = f"{checkpoint_dir}-{train_steps:07d}"
-                prompt_name = args.prompt_csv.split('/')[-1].split('.')[0].lower()
-                folder_name = f"{ckpt_string_name}-{prompt_name}-size-{args.image_size}-size-{args.image_size}-{args.vq_model}-" \
-                            f"topk-{args.top_k}-topp-{args.top_p}-temperature-{args.temperature}-" \
-                            f"cfg-{args.cfg_scale}-seed-{args.global_seed}"
-                # sample_folder_dir = f"{args.sample_dir}/{folder_name}"
-                sample_folder_dir = folder_name
-                if rank == 0:
-                    os.makedirs(f"{sample_folder_dir}/images", exist_ok=True)
-
-                df = pd.read_csv(args.prompt_csv, delimiter='\t')
-                prompt_list = df['Prompt'].tolist()
-
-                val_dataset_full = build_dataset(val_args, transform=transform)
-                val_global_batch_size = args.global_batch_size 
-                n = args.global_batch_size // dist.get_world_size()
-                val_subset = Subset(val_dataset_full, range(args.num_fid_samples))
-                val_sampler = DistributedSampler(
-                    val_subset,
-                    num_replicas=world_size,
-                    rank=rank,
-                    shuffle=False,
-                    seed=args.global_seed
-                )
-                val_loader = DataLoader(
-                    val_subset,
-                    batch_size=int(args.global_batch_size // world_size // args.gradient_accumulation_steps),
-                    shuffle=False,
-                    sampler=val_sampler,
-
-                    num_workers=args.num_workers,
-                    pin_memory=True,
-                    drop_last=True
-                )
-                num_fid_samples = min(args.num_fid_samples, len(val_subset))
-
-                # To make things evenly-divisible, we'll sample a bit more than we need and then discard the extra samples:
-                total_samples = int(math.ceil(num_fid_samples / val_global_batch_size) * val_global_batch_size)
-                if rank == 0:
-                    print(f"Total number of images that will be sampled: {total_samples} in {sample_folder_dir}")
-                assert total_samples % dist.get_world_size() == 0, "total_samples must be divisible by world_size"
-                samples_needed_this_gpu = int(total_samples // dist.get_world_size())
-                assert samples_needed_this_gpu % n == 0, "samples_needed_this_gpu must be divisible by the per-GPU batch size"
-
-
-                total_val = 0
-                validation_samples, validation_samples_gt = [], []
-                for val_data in val_loader:
-
-                    val_img, val_t5_feat_padding, val_attn_mask, _ = val_data
-                    val_img, val_t5_feat_padding, val_attn_mask = val_img.to(device), val_t5_feat_padding.to(device), val_attn_mask.to(device)
-                    val_t5_feat_padding = val_t5_feat_padding[:, 0] #
-                    val_attn_mask = val_attn_mask[:, 0] # bsz, 1, seq_len, seq_len
-                    if args.cfg_scale != 1:
-                        val_attn_mask = val_attn_mask.repeat([2,1,1])
-                    qzshape = [val_img.size(0), args.codebook_embed_dim, latent_size, latent_size]
-
-                    if args.gpt_model.startswith("R-GPT") :
-
-                        val_index_sample = generate_RLlamaGen(
-                        model.module, val_t5_feat_padding, latent_size ** 2, 
-                        val_attn_mask, 
-                        cfg_scale=args.cfg_scale,
-                        temperature=args.temperature, top_k=args.top_k,
-                        top_p=args.top_p, sample_logits=True, 
-                        vq_model = vq_model, qzshape =qzshape, 
-                        image_size=args.image_size,
-                        
-                        )
-                    else:
-                        val_index_sample = generate_with_decoder(
-                        model.module, val_t5_feat_padding, latent_size ** 2, 
-                        emb_masks=None,
-                        attn_mask=val_attn_mask, 
-                        cfg_scale=args.cfg_scale,
-
-                        temperature=args.temperature, top_k=args.top_k,
-                        top_p=args.top_p, sample_logits=True, 
-                        vq_model = vq_model, qzshape =qzshape,                         
-                        )
-                    if rank == 0:
-                        # log the first image in each batch
-                        val_index_sample_tb_norm = (val_index_sample[0] + 1) / 2
-                        validation_samples.append(val_index_sample_tb_norm)
-                        validation_samples_gt.append((val_img[0] + 1) / 2)
                     
-                    samples = torch.clamp(127.5 * val_index_sample + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
-                    
-                    # Save samples to disk as individual .png files
-                    for i, sample in enumerate(samples):
-                        index = i * dist.get_world_size() + rank + total_val
-                        Image.fromarray(sample).save(f"{sample_folder_dir}/images/{index:06d}.png")
-                    total_val += val_global_batch_size
-                    model.module.clear_caches()
-
-                # Make sure all processes have finished saving their samples before attempting to convert to .npz
                 dist.barrier()
-                model.train()
-                if rank == 0:
-                    # log generated images into tb
-                    writer.add_image(f'Inference Sample', torch.cat(validation_samples, dim=-1), train_steps)
-                    writer.add_image(f'Inference Sample GT', torch.cat(validation_samples_gt, dim=-1), train_steps)
 
-                    # Save infer result in a jsonl file
-                    json_items = []
-                    for idx, prompt in enumerate(prompt_list):
-                        image_path = os.path.join(sample_folder_dir, "images", f"{idx:06d}.png")
-                        json_items.append({"text": prompt, "image_path": image_path})
-                    res_jsonl_path = os.path.join(sample_folder_dir, "result.jsonl")
-                    print(f"Save jsonl to {res_jsonl_path}...")
-                    with open(res_jsonl_path, "w") as f:
-                        for item in json_items:
-                            f.write(json.dumps(item) + "\n")
-
-                    # Save captions to txt
-                    caption_path = os.path.join(sample_folder_dir, "captions.txt")
-                    print(f"Save captions to {caption_path}...")
-                    with open(caption_path, "w") as f:
-                        for item in prompt_list:
-                            f.write(f"{item}\n")
-                    # evaluate
-
-
-                    clip_score, fid = evaluate_model_during_validation(ref_dir="/home/wuhuimin/data/coco/images/", ref_data = 'coco2014', ref_type = 'val2014', 
-                                                     fake_dir = sample_folder_dir, eval_res=args.eval_res, 
-                                                    eval_batch_size=args.eval_batch_size, eval_clip_model4eval=args.eval_clip_model4eval,
-                                                    clip_device = 'cpu', fid_device = torch.device('cuda:0'), use_dataparallel = False)#, how_many=total_samples)
-                    print(clip_score, fid)
-                    writer.add_scalar('Evaluation/CLIP', clip_score, train_steps)
-                    writer.add_scalar('Evaluation/fid', fid, train_steps)
-                dist.barrier()
-                # end of saving
             if train_steps % args.log_every == 0:
                 # Measure training speed:
                 torch.cuda.synchronize()
@@ -525,38 +354,27 @@ def main(args, val_args):
                     model.train()
                 dist.barrier()
                 
-        if not args.no_epoch_save:
-            if rank == 0:
-                
-                model_weight = model.module.state_dict()  
-                checkpoint = {
-                    "model": model_weight,
-                    "optimizer": optimizer.state_dict(),
-                    "steps": train_steps,
-                    "args": args
-                }
-                if not args.no_local_save:
-                    checkpoint_path = f"{checkpoint_dir}/epoch_{epoch:03d}_{train_steps:07d}.pt"
-                    torch.save(checkpoint, checkpoint_path)
-                    logger.info(f"Saved checkpoint to {checkpoint_path}")
+        # save checkpoints per epoch
+        if rank == 0:
+            
+            model_weight = model.module.state_dict()  
+            checkpoint = {
+                "model": model_weight,
+                "optimizer": optimizer.state_dict(),
+                "steps": train_steps,
+                "args": args
+            }
+            if not args.no_local_save:
+                checkpoint_path = f"{checkpoint_dir}/epoch_{epoch:03d}_{train_steps:07d}.pt"
+                torch.save(checkpoint, checkpoint_path)
+                logger.info(f"Saved checkpoint to {checkpoint_path}")
 
-                    # Check and delete the oldest checkpoint if the total number exceeds the threshold
-                    checkpoint_files = sorted(glob(f"{checkpoint_dir}/*.pt"), key=os.path.getctime)
-                    if len(checkpoint_files) > args.max_checkpoints:
-                        oldest_checkpoint = checkpoint_files[0]
-                        os.remove(oldest_checkpoint)
-                        logger.info(f"Deleted oldest checkpoint {oldest_checkpoint} to maintain max checkpoints limit")
-                if not args.no_cloud_save:
-                    cloud_checkpoint_path = f"{cloud_checkpoint_dir}/epoch_{epoch:03d}_{train_steps:07d}.pt"
-                    torch.save(checkpoint, cloud_checkpoint_path)
-                    logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path}")
-
-                    # Check and delete the oldest checkpoint if the total number exceeds the threshold
-                    checkpoint_files = sorted(glob(f"{cloud_checkpoint_path}/*.pt"), key=os.path.getctime)
-                    if len(checkpoint_files) > args.max_checkpoints:
-                        oldest_checkpoint = checkpoint_files[0]
-                        os.remove(oldest_checkpoint)
-                        logger.info(f"Deleted oldest checkpoint {oldest_checkpoint} to maintain max checkpoints limit")
+                # Check and delete the oldest checkpoint if the total number exceeds the threshold
+                checkpoint_files = sorted(glob(f"{checkpoint_dir}/*.pt"), key=os.path.getctime)
+                if len(checkpoint_files) > args.max_checkpoints:
+                    oldest_checkpoint = checkpoint_files[0]
+                    os.remove(oldest_checkpoint)
+                    logger.info(f"Deleted oldest checkpoint {oldest_checkpoint} to maintain max checkpoints limit")
 
         if exit_flag:
             break
@@ -580,7 +398,6 @@ if __name__ == "__main__":
     parser.add_argument("--short-t5-feat-path", type=str, default=None, help="short caption of t5_feat_path")
     parser.add_argument("--cloud-save-path", type=str, required=False, help='please specify a cloud disk path, if not, local path')
     parser.add_argument("--no-local-save", action='store_true', help='no save checkpoints to local path for limited disk volume')
-    parser.add_argument("--no-cloud-save", action='store_true', help='no save checkpoints to cloud')
 
     parser.add_argument("--vq-model", type=str, choices=list(VQ_models.keys()), default="VQ-16")
     parser.add_argument("--vq-ckpt", type=str, default=None, help="ckpt path for vq model")
@@ -614,16 +431,11 @@ if __name__ == "__main__":
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--mixed-precision", type=str, default='bf16', choices=["none", "fp16", "bf16"]) 
 
-    
-    # augmentation
-    parser.add_argument("--aug_remove_white_borders",  action='store_true') # aug_remove_white_borders
-
     # for early stop
     parser.add_argument("--early-stop", type=int, default=-1)
     parser.add_argument("--init-gpt-ckpt", type=str, default=None, help="ckpt path for init training")
 
     # logging
-    parser.add_argument("--no_epoch_save", action='store_true', help='no_epoch_save')
     parser.add_argument("--max_checkpoints", type=int, default=5)
 
 
@@ -634,24 +446,6 @@ if __name__ == "__main__":
     parser.add_argument("--top-p", type=float, default=1.0, help="top-p value to sample with")
     parser.add_argument("--eval_order_version_id", type=int, default=1)
 
-    # for validation
-    parser.add_argument("--validate_every", type=int,  default=-1)
-    parser.add_argument("--validation_data_path", type=str,)
-    parser.add_argument("--prompt-csv", type=str, default='evaluations/t2i/coco_captions.csv')
-    parser.add_argument("--num_fid_samples", type=int,  default=1600)
-    parser.add_argument("--eval_clip_model4eval", default="ViT-B/32", type=str, help="[WO, ViT-B/32, ViT-G/14]")
-    parser.add_argument("--eval_res", default=256, type=int)
-    parser.add_argument("--eval_batch_size", default=8, type=int)
-
-
-
-    
     args = parser.parse_args()
 
-    val_args = argparse.Namespace()
-    val_args.dataset = args.dataset
-    val_args.data_path = args.validation_data_path
-    val_args.image_size = args.image_size
-    val_args.downsample_size = args.downsample_size
-
-    main(args, val_args)
+    main(args)
